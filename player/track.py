@@ -21,6 +21,9 @@ class Track:
     # Se completan al resolver (ver sources.ensure_resolved).
     stream_url: str | None = None
     resolved_at: float | None = None
+    # Info completa de yt-dlp. YouTube rechaza (403) que ffmpeg abra la URL
+    # directa, así que el audio se baja con yt-dlp reusando esta info.
+    info: dict | None = field(default=None, repr=False)
     # Tarea de resolución en curso; evita resolver dos veces el mismo track
     # cuando coinciden el prefetch y la reproducción.
     resolving: asyncio.Task | None = field(default=None, repr=False)
@@ -31,6 +34,7 @@ class Track:
         now = time.monotonic() if now is None else now
         return (now - self.resolved_at) > STREAM_TTL_SECONDS
 
-    def mark_resolved(self, stream_url: str, now: float | None = None) -> None:
+    def mark_resolved(self, stream_url: str, now: float | None = None, info: dict | None = None) -> None:
         self.stream_url = stream_url
+        self.info = info
         self.resolved_at = time.monotonic() if now is None else now

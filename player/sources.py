@@ -187,6 +187,9 @@ def _extract_stream(query: str) -> dict:
 
     with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
         info = ydl.extract_info(query, download=False)
+        # Serializable a JSON: se le pasa a `yt-dlp --load-info-json` al reproducir.
+        if info is not None:
+            info = ydl.sanitize_info(info)
     if info is None:
         raise SourceError("No encontré resultados.")
     if "entries" in info:
@@ -224,7 +227,7 @@ async def _resolve_track(track: Track) -> None:
         log.warning("No se pudo resolver %r: %s", track.query, exc)
         raise SourceError("no pude obtener el audio") from exc
 
-    track.mark_resolved(info["url"])
+    track.mark_resolved(info["url"], info=info)
     # Completar lo que faltaba sin pisar lo que ya sabíamos (p. ej. el título
     # "Artista - Tema" que vino de Spotify).
     track.webpage_url = track.webpage_url or info.get("webpage_url")

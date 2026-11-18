@@ -6,7 +6,12 @@ solo se traduce entre eso y discord.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import subprocess
+import sys
+import tempfile
 
 import discord
 from discord import app_commands
@@ -42,6 +47,69 @@ def track_embed(track: Track, header: str = "Sonando ahora") -> discord.Embed:
     return embed
 
 
+class YtdlpPipeAudio(discord.FFmpegPCMAudio):
+    """Audio bajado por yt-dlp y pasado a ffmpeg por un pipe.
+
+    YouTube devuelve 403 cuando ffmpeg abre la URL directa del stream, pero
+    acepta las peticiones de yt-dlp. `--load-info-json` reusa la info ya
+    resuelta (prefetch incluido), así que no se vuelve a extraer nada.
+    """
+
+    def __init__(self, info: dict):
+        fd, self._info_path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+        # Los errores de yt-dlp van a un archivo y se loguean si falla.
+        self._ytdlp_log = tempfile.TemporaryFile()
+        self._downloader = subprocess.Popen(
+            [
+                sys.executable, "-m", "yt_dlp",
+                "--quiet", "--no-warnings", "--no-progress", "--force-ipv4",
+                # Sin -f, al escribir a stdout yt-dlp elige un formato de
+                # video (el 18), que YouTube suele rechazar o demorar.
+                "-f", "bestaudio/best",
+                "--load-info-json", self._info_path,
+                "-o", "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=self._ytdlp_log,
+        )
+        try:
+            super().__init__(self._downloader.stdout, pipe=True, options=FFMPEG_OPTIONS)
+        except Exception:
+            self._close_downloader()
+            raise
+
+    def cleanup(self) -> None:
+        # Primero yt-dlp: así el hilo que copia el pipe a ffmpeg recibe EOF y
+        # termina solo, en vez de chocar con el ffmpeg ya cerrado.
+        self._close_downloader()
+        super().cleanup()
+
+    def _close_downloader(self) -> None:
+        # discord.py llama a cleanup() también desde __del__: solo una vez.
+        if self._ytdlp_log.closed:
+            return
+        proc = self._downloader
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log.warning("yt-dlp no terminó tras kill (pid %s)", proc.pid)
+        elif proc.returncode != 0:
+            self._ytdlp_log.seek(0)
+            detail = self._ytdlp_log.read().decode("utf-8", "replace").strip()[-800:]
+            log.warning("yt-dlp falló (código %s): %s", proc.returncode, detail or "sin detalle")
+        self._ytdlp_log.close()
+        if proc.stdout is not None:
+            proc.stdout.close()
+        try:
+            os.remove(self._info_path)
+        except OSError:
+            pass
+
+
 class DiscordBackend:
     """Adapta el VoiceClient de discord.py a la interfaz que usa el motor."""
 
@@ -65,11 +133,14 @@ class DiscordBackend:
         return vc is not None and vc.is_paused()
 
     def play(self, track: Track, volume: float, after) -> None:
-        source = discord.FFmpegPCMAudio(
-            track.stream_url,
-            before_options=FFMPEG_BEFORE_OPTIONS,
-            options=FFMPEG_OPTIONS,
-        )
+        if track.info is not None:
+            source = YtdlpPipeAudio(track.info)
+        else:
+            source = discord.FFmpegPCMAudio(
+                track.stream_url,
+                before_options=FFMPEG_BEFORE_OPTIONS,
+                options=FFMPEG_OPTIONS,
+            )
         self._vc.play(discord.PCMVolumeTransformer(source, volume=volume), after=after)
 
     def stop(self) -> None:
@@ -264,8 +335,9 @@ class PlayerControls(discord.ui.View):
         queue.shuffle()
         await interaction.response.send_message("Cola mezclada.", ephemeral=True)
 
+    # No puede llamarse `stop`: pisaría View.stop() y _strip_controls fallaría.
     @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger)
-    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.session.engine.stop()
         await interaction.response.send_message("Detuve la música y vacié la cola.", ephemeral=True)
 
