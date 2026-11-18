@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    # Evita que los logs crezcan sin límite en un VPS chico
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
