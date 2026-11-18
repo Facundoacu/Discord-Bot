@@ -18,9 +18,16 @@ class Track:
     query: str
     webpage_url: str | None = None
     duration: int | None = None
+    # Lo agregó el autoplay (no un usuario): cede su lugar a lo que pidan.
+    autoplay: bool = False
+    # Reintentos hechos porque falló la descarga del audio (ver engine).
+    stream_retries: int = 0
     # Se completan al resolver (ver sources.ensure_resolved).
     stream_url: str | None = None
     resolved_at: float | None = None
+    # Info completa de yt-dlp. YouTube rechaza (403) que ffmpeg abra la URL
+    # directa, así que el audio se baja con yt-dlp reusando esta info.
+    info: dict | None = field(default=None, repr=False)
     # Tarea de resolución en curso; evita resolver dos veces el mismo track
     # cuando coinciden el prefetch y la reproducción.
     resolving: asyncio.Task | None = field(default=None, repr=False)
@@ -31,6 +38,14 @@ class Track:
         now = time.monotonic() if now is None else now
         return (now - self.resolved_at) > STREAM_TTL_SECONDS
 
-    def mark_resolved(self, stream_url: str, now: float | None = None) -> None:
+    def invalidate(self) -> None:
+        """Olvida la resolución: la próxima vez se extrae de cero (URL nueva)."""
+        self.stream_url = None
+        self.info = None
+        self.resolved_at = None
+        self.resolving = None
+
+    def mark_resolved(self, stream_url: str, now: float | None = None, info: dict | None = None) -> None:
         self.stream_url = stream_url
+        self.info = info
         self.resolved_at = time.monotonic() if now is None else now

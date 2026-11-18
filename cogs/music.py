@@ -6,7 +6,12 @@ solo se traduce entre eso y discord.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import subprocess
+import sys
+import tempfile
 
 import discord
 from discord import app_commands
@@ -14,9 +19,9 @@ from discord.ext import commands
 
 import config
 from player.engine import PlayerEngine
-from player.errors import SourceError
+from player.errors import SourceError, StreamError
 from player.queue import LoopMode
-from player.sources import build_tracks, ensure_resolved
+from player.sources import build_tracks, ensure_resolved, related_tracks, track_key
 from player.text import LOOP_LABELS, escape_md, format_duration, format_queue, truncate
 from player.track import Track
 
@@ -24,6 +29,25 @@ log = logging.getLogger("music")
 
 FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS = "-vn"
+# Cuánto cambian el volumen los botones 🔉 / 🔊 (en puntos de 0-100).
+VOLUME_STEP = 10
+OPUS_BITRATE_KBPS = 128
+
+
+def perceptual_gain(volume: float) -> float:
+    """Convierte el volumen 0-1 que ve el usuario en ganancia de audio.
+
+    El oído percibe el volumen en forma logarítmica: con una escala lineal el
+    50 % apenas baja 6 dB y casi no se nota. Al cuadrado, el 50 % queda en
+    −12 dB y el 10 % en −40 dB, que se siente como "la mitad" y "bajito".
+    """
+    return max(0.0, min(1.0, volume)) ** 2
+
+
+def autoplay_text(enabled: bool) -> str:
+    if enabled:
+        return "🎲 Autoplay activado: cuando se termine la cola sigo con temas parecidos."
+    return "Autoplay desactivado."
 
 
 def _label(track: Track) -> str:
@@ -40,6 +64,90 @@ def track_embed(track: Track, header: str = "Sonando ahora") -> discord.Embed:
     embed.add_field(name="Duración", value=format_duration(track.duration))
     embed.set_footer(text=f"Pedido por {truncate(track.requester, 40)}")
     return embed
+
+
+class YtdlpPipeAudio(discord.FFmpegPCMAudio):
+    """Audio bajado por yt-dlp y pasado a ffmpeg por un pipe.
+
+    YouTube devuelve 403 cuando ffmpeg abre la URL directa del stream, pero
+    acepta las peticiones de yt-dlp. `--load-info-json` reusa la info ya
+    resuelta (prefetch incluido), así que no se vuelve a extraer nada.
+    """
+
+    def __init__(self, info: dict):
+        fd, self._info_path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+        # Los errores de yt-dlp van a un archivo y se loguean si falla.
+        self._ytdlp_log = tempfile.TemporaryFile()
+        self._downloader = subprocess.Popen(
+            [
+                sys.executable, "-m", "yt_dlp",
+                "--quiet", "--no-warnings", "--no-progress", "--force-ipv4",
+                # Sin -f, al escribir a stdout yt-dlp elige un formato de
+                # video (el 18), que YouTube suele rechazar o demorar.
+                "-f", "bestaudio/best",
+                "--load-info-json", self._info_path,
+                "-o", "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=self._ytdlp_log,
+        )
+        self._got_audio = False
+        try:
+            super().__init__(self._downloader.stdout, pipe=True, options=FFMPEG_OPTIONS)
+        except Exception:
+            self._close_downloader()
+            raise
+
+    def read(self) -> bytes:
+        data = super().read()
+        if data:
+            self._got_audio = True
+        elif not self._got_audio:
+            # Terminó sin dar ni un frame: si fue porque yt-dlp falló (p. ej.
+            # YouTube respondió 403), avisar al motor para que reintente.
+            # discord.py pasa esta excepción al callback `after`.
+            self._raise_if_download_failed()
+        return data
+
+    def _raise_if_download_failed(self) -> None:
+        proc = self._downloader
+        try:
+            code = proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            return
+        if code != 0:
+            raise StreamError(f"yt-dlp no pudo bajar el audio (código {code})")
+
+    def cleanup(self) -> None:
+        # Primero yt-dlp: así el hilo que copia el pipe a ffmpeg recibe EOF y
+        # termina solo, en vez de chocar con el ffmpeg ya cerrado.
+        self._close_downloader()
+        super().cleanup()
+
+    def _close_downloader(self) -> None:
+        # discord.py llama a cleanup() también desde __del__: solo una vez.
+        if self._ytdlp_log.closed:
+            return
+        proc = self._downloader
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log.warning("yt-dlp no terminó tras kill (pid %s)", proc.pid)
+        elif proc.returncode != 0:
+            self._ytdlp_log.seek(0)
+            detail = self._ytdlp_log.read().decode("utf-8", "replace").strip()[-800:]
+            log.warning("yt-dlp falló (código %s): %s", proc.returncode, detail or "sin detalle")
+        self._ytdlp_log.close()
+        if proc.stdout is not None:
+            proc.stdout.close()
+        try:
+            os.remove(self._info_path)
+        except OSError:
+            pass
 
 
 class DiscordBackend:
@@ -65,12 +173,49 @@ class DiscordBackend:
         return vc is not None and vc.is_paused()
 
     def play(self, track: Track, volume: float, after) -> None:
-        source = discord.FFmpegPCMAudio(
-            track.stream_url,
-            before_options=FFMPEG_BEFORE_OPTIONS,
-            options=FFMPEG_OPTIONS,
+        if track.info is not None:
+            source = YtdlpPipeAudio(track.info)
+        else:
+            source = discord.FFmpegPCMAudio(
+                track.stream_url,
+                before_options=FFMPEG_BEFORE_OPTIONS,
+                options=FFMPEG_OPTIONS,
+            )
+        self._vc.play(
+            discord.PCMVolumeTransformer(source, volume=perceptual_gain(volume)),
+            after=after,
+            # Opus afinado para música (no voz) a la calidad máxima que acepta.
+            signal_type="music",
+            bitrate=OPUS_BITRATE_KBPS,
         )
-        self._vc.play(discord.PCMVolumeTransformer(source, volume=volume), after=after)
+        try:
+            asyncio.get_running_loop().call_later(5, self._log_voice_state)
+        except RuntimeError:
+            pass
+
+    def _log_voice_state(self) -> None:
+        """Diagnóstico: si el cifrado de voz (DAVE) no está listo, Discord
+        descarta el audio en silencio aunque el bot figure hablando."""
+        vc = self._vc
+        if vc is None:
+            return
+        conn = vc._connection
+        session = conn.dave_session
+        if session is None:
+            log.info("Voz: DAVE versión %s, sin sesión", conn.dave_protocol_version)
+            return
+        try:
+            stats = session.get_encryption_stats()
+            stats_text = f"ok={stats.successes} fallas={stats.failures}"
+        except Exception as exc:  # la API de davey puede variar entre versiones
+            stats_text = f"sin stats ({exc})"
+        # Sin cifrado listo, Discord tira el audio: eso sí merece un warning.
+        level = logging.DEBUG if conn.can_encrypt else logging.WARNING
+        log.log(
+            level,
+            "Voz: DAVE versión %s, estado %s, listo=%s, puede cifrar=%s, %s",
+            conn.dave_protocol_version, session.status, session.ready, conn.can_encrypt, stats_text,
+        )
 
     def stop(self) -> None:
         if self._vc is not None:
@@ -87,7 +232,7 @@ class DiscordBackend:
     def set_volume(self, volume: float) -> None:
         vc = self._vc
         if vc is not None and isinstance(vc.source, discord.PCMVolumeTransformer):
-            vc.source.volume = volume
+            vc.source.volume = perceptual_gain(volume)
 
 
 class GuildSession:
@@ -109,6 +254,9 @@ class GuildSession:
             on_idle=self._on_idle,
             max_queue=config.MAX_QUEUE_SIZE,
             volume=config.DEFAULT_VOLUME,
+            recommender=related_tracks,
+            autoplay=config.AUTOPLAY,
+            track_key=track_key,
         )
 
     # --- voz ------------------------------------------------------------
@@ -264,8 +412,30 @@ class PlayerControls(discord.ui.View):
         queue.shuffle()
         await interaction.response.send_message("Cola mezclada.", ephemeral=True)
 
+    async def _change_volume(self, interaction: discord.Interaction, delta: int) -> None:
+        engine = self.session.engine
+        percent = min(100, max(0, round(engine.volume * 100) + delta))
+        engine.set_volume(percent)
+        await interaction.response.send_message(f"Volumen: {percent}%.", ephemeral=True)
+
+    # Segunda fila: la primera ya tiene los 5 botones que entran.
+    @discord.ui.button(emoji="🎲", style=discord.ButtonStyle.secondary, row=1)
+    async def autoplay_toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        engine = self.session.engine
+        engine.set_autoplay(not engine.autoplay)
+        await interaction.response.send_message(autoplay_text(engine.autoplay), ephemeral=True)
+
+    @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, row=1)
+    async def volume_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._change_volume(interaction, -VOLUME_STEP)
+
+    @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, row=1)
+    async def volume_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._change_volume(interaction, VOLUME_STEP)
+
+    # No puede llamarse `stop`: pisaría View.stop() y _strip_controls fallaría.
     @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger)
-    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.session.engine.stop()
         await interaction.response.send_message("Detuve la música y vacié la cola.", ephemeral=True)
 
@@ -499,6 +669,17 @@ class Music(commands.Cog):
             return
         session.engine.set_volume(nivel)
         await interaction.response.send_message(f"Volumen al {nivel}%.")
+
+    @app_commands.command(name="autoplay", description="Al terminarse la cola, seguir con temas parecidos")
+    @app_commands.describe(activar="Encender o apagar (sin elegir, lo alterna)")
+    @app_commands.guild_only()
+    async def autoplay(self, interaction: discord.Interaction, activar: bool | None = None):
+        session = await self.require_session(interaction)
+        if session is None:
+            return
+        engine = session.engine
+        engine.set_autoplay(not engine.autoplay if activar is None else activar)
+        await interaction.response.send_message(autoplay_text(engine.autoplay))
 
     # --- eventos --------------------------------------------------------
 

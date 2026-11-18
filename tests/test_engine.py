@@ -1,7 +1,7 @@
 import asyncio
 
 from player.engine import PlayerEngine
-from player.errors import SourceError
+from player.errors import SourceError, StreamError
 from player.queue import LoopMode
 from player.track import Track
 
@@ -33,11 +33,11 @@ class FakeBackend:
     def resume(self): self.paused = False
     def set_volume(self, v): self.volume = v
 
-    def finish(self):
+    def finish(self, error=None):
         if self.playing is None:
             return
         after, self.playing, self.paused = self.after, None, False
-        after(None)
+        after(error)
 
 
 def mk(n: int) -> Track:
@@ -120,6 +120,18 @@ def test_next_track_is_prefetched_while_current_plays():
         await h.engine.start_if_idle()
         await settle()
         assert h.resolved == ["t1", "t2"]  # t2 ya está lista antes de que termine t1
+    run(scenario())
+
+
+def test_track_added_while_playing_is_prefetched_right_away():
+    async def scenario():
+        h = Harness()
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.engine.add([mk(2)])  # llega mientras suena t1
+        await settle()
+        assert h.resolved == ["t1", "t2"]  # un skip ya no espera la extracción
     run(scenario())
 
 
@@ -272,4 +284,162 @@ def test_set_volume_applies_to_backend_and_future_tracks():
         h.engine.add([mk(1)])
         await h.engine.start_if_idle()
         assert h.backend.volume == 0.3
+    run(scenario())
+
+
+# --- autoplay ---------------------------------------------------------------
+
+def auto(n: int) -> Track:
+    return Track(title=f"a{n}", requester="🎲", query=f"auto{n}", autoplay=True)
+
+
+def with_autoplay(h: Harness, batches: list[list[Track]]) -> list[set[str]]:
+    """Activa el autoplay con un recomendador falso; devuelve los `exclude` que recibió."""
+    seen: list[set[str]] = []
+
+    async def recommender(seed, exclude):
+        seen.append(set(exclude))
+        return batches.pop(0) if batches else []
+
+    h.engine._recommender = recommender
+    h.engine.autoplay = True
+    return seen
+
+
+def test_autoplay_searches_while_last_track_plays_and_continues():
+    async def scenario():
+        h = Harness()
+        seen = with_autoplay(h, [[auto(1), auto(2)]])
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        assert len(seen) == 1 and "q1" in seen[0]  # buscó mientras sonaba t1, sabiendo que t1 ya sonó
+        assert h.resolved == ["t1", "a1"]          # y precargó el primero
+        h.backend.finish()
+        await settle()
+        assert h.backend.playing.title == "a1"
+        assert h.idle_calls == 0
+    run(scenario())
+
+
+def test_autoplay_waits_for_search_if_queue_ends_first():
+    async def scenario():
+        h = Harness()
+        with_autoplay(h, [[], [auto(1)]])  # la búsqueda en segundo plano no trajo nada
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.backend.finish()  # al terminarse la cola vuelve a buscar
+        await settle()
+        assert h.backend.playing.title == "a1"
+    run(scenario())
+
+
+def test_user_tracks_jump_ahead_of_autoplay_ones():
+    async def scenario():
+        h = Harness()
+        with_autoplay(h, [[auto(1), auto(2)]])
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.engine.add([mk(2)])
+        assert [t.title for t in h.engine.queue.upcoming()] == ["t2"]
+    run(scenario())
+
+
+def test_stop_does_not_trigger_autoplay():
+    async def scenario():
+        h = Harness()
+        seen = with_autoplay(h, [[auto(1)], [auto(2)]])
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.engine.stop()
+        await settle()
+        assert h.backend.playing is None and len(h.engine.queue) == 0
+        assert len(seen) == 1  # solo la búsqueda de cuando arrancó t1
+    run(scenario())
+
+
+def test_without_autoplay_queue_end_goes_idle():
+    async def scenario():
+        h = Harness()
+        seen = with_autoplay(h, [[auto(1)]])
+        h.engine.autoplay = False
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.backend.finish()
+        await settle()
+        assert seen == [] and h.backend.playing is None and h.idle_calls == 1
+    run(scenario())
+
+
+def test_turning_autoplay_off_drops_its_tracks():
+    async def scenario():
+        h = Harness()
+        with_autoplay(h, [[auto(1), auto(2)]])
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        assert len(h.engine.queue) == 2
+        h.engine.set_autoplay(False)
+        assert len(h.engine.queue) == 0
+    run(scenario())
+
+
+# --- reintento si falla la descarga ------------------------------------------
+
+def test_failed_download_is_retried_once_with_a_fresh_resolution():
+    async def scenario():
+        h = Harness()
+        h.engine.add([mk(1), mk(2)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.backend.finish(StreamError("403"))  # YouTube rechazó la descarga
+        await settle()
+        assert h.backend.playing.title == "t1"           # el mismo tema, de nuevo
+        assert h.backend.played == ["t1", "t1"]
+        assert h.resolved.count("t1") == 2               # con una resolución nueva
+        assert h.started == ["t1"] and h.notes == []     # sin re-anunciar ni avisar
+    run(scenario())
+
+
+def test_failed_download_twice_skips_and_tells_the_user():
+    async def scenario():
+        h = Harness()
+        h.engine.add([mk(1), mk(2)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.backend.finish(StreamError("403"))
+        await settle()
+        h.backend.finish(StreamError("403"))  # el reintento también falló
+        await settle()
+        assert h.backend.playing.title == "t2"
+        assert len(h.notes) == 1 and "t1" in h.notes[0] and "YouTube" in h.notes[0]
+    run(scenario())
+
+
+def test_skip_is_never_retried_even_if_download_was_failing():
+    async def scenario():
+        h = Harness()
+        h.engine.add([mk(1), mk(2)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.engine._skip_requested = True
+        h.backend.finish(StreamError("403"))
+        await settle()
+        assert h.backend.playing.title == "t2" and h.notes == []
+    run(scenario())
+
+
+def test_other_playback_errors_just_advance():
+    async def scenario():
+        h = Harness()
+        h.engine.add([mk(1), mk(2)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.backend.finish(RuntimeError("ffmpeg murió"))
+        await settle()
+        assert h.backend.played == ["t1", "t2"]
     run(scenario())

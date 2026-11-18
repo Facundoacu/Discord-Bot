@@ -22,3 +22,5 @@ IDLE_TIMEOUT_SECONDS = _int("IDLE_TIMEOUT_SECONDS", 300)
 ALONE_TIMEOUT_SECONDS = _int("ALONE_TIMEOUT_SECONDS", 60)
 # Volumen inicial (0-100).
 DEFAULT_VOLUME = min(100, max(0, _int("DEFAULT_VOLUME", 50))) / 100
+# Autoplay: al terminarse la cola, seguir con temas parecidos al último.
+AUTOPLAY = os.getenv("AUTOPLAY", "true").strip().lower() not in ("0", "false", "no", "off")

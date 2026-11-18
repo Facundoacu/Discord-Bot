@@ -1,6 +1,10 @@
 # [voice] trae PyNaCl y davey: Discord exige cifrado de voz (DAVE) y sin davey
 # el bot no puede entrar a canales de voz.
 discord.py[voice]>=2.7.1
+# discord.py 2.7.1 se escribió contra davey 0.1.x. Con davey 0.2.0 la sesión
+# queda "active" pero ready=False: el audio sale sin cifrar y Discord lo
+# descarta (el bot figura hablando pero no se escucha nada).
+davey>=0.1.7,<0.2
 # [default] incluye yt-dlp-ejs, que YouTube necesita junto con un runtime de JavaScript (Deno)
 yt-dlp[default]
 spotipy>=2.24.0

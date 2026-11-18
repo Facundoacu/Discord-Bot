@@ -68,6 +68,13 @@ class TrackQueue:
             self.current = None
         return removed
 
+    def drop_autoplay(self) -> int:
+        """Saca los pendientes que puso el autoplay. Devuelve cuántos sacó."""
+        kept = deque(t for t in self._items if not t.autoplay)
+        removed = len(self._items) - len(kept)
+        self._items = kept
+        return removed
+
     def shuffle(self) -> None:
         items = list(self._items)
         random.shuffle(items)

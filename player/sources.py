@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 from urllib.parse import parse_qs, urlparse
@@ -71,6 +72,29 @@ def is_youtube_playlist_url(text: str) -> bool:
     return parsed.path == "/playlist" and "list" in parse_qs(parsed.query)
 
 
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def youtube_video_id(url: str | None) -> str | None:
+    """ID del video para links de YouTube (watch, youtu.be, shorts); si no, None."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    candidate = None
+    if host == "youtu.be":
+        candidate = parsed.path.lstrip("/").split("/")[0]
+    elif host in _YOUTUBE_HOSTS:
+        if parsed.path == "/watch":
+            candidate = (parse_qs(parsed.query).get("v") or [None])[0]
+        elif parsed.path.startswith("/shorts/"):
+            candidate = parsed.path.split("/")[2]
+    return candidate if candidate and _VIDEO_ID_RE.match(candidate) else None
+
+
 # ---------------------------------------------------------------------------
 # Spotify (solo metadata: el audio sale de YouTube)
 # ---------------------------------------------------------------------------
@@ -127,8 +151,10 @@ def collect_spotify_tracks(sp, kind: str, spotify_id: str, requester: str, limit
 
 
 def _spotify_client():
-    client_id = os.getenv("SPOTIFY_CLIENT_ID")
-    client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+    import secret_store
+
+    client_id = secret_store.get("SPOTIFY_CLIENT_ID")
+    client_secret = secret_store.get("SPOTIFY_CLIENT_SECRET")
     if not client_id or not client_secret:
         raise SourceError(
             "Para usar links de Spotify hay que configurar "
@@ -187,6 +213,9 @@ def _extract_stream(query: str) -> dict:
 
     with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
         info = ydl.extract_info(query, download=False)
+        # Serializable a JSON: se le pasa a `yt-dlp --load-info-json` al reproducir.
+        if info is not None:
+            info = ydl.sanitize_info(info)
     if info is None:
         raise SourceError("No encontré resultados.")
     if "entries" in info:
@@ -197,6 +226,53 @@ def _extract_stream(query: str) -> dict:
     if not info.get("url"):
         raise SourceError("No pude obtener el audio de ese video.")
     return info
+
+
+def _search_youtube(query: str) -> dict | None:
+    """Primer resultado de YouTube sin extraer el audio (~1 s, no ~4 s).
+
+    Devuelve {"url", "title", "duration"} o None si no sirve; en ese caso se
+    usa la búsqueda completa de siempre.
+    """
+    import yt_dlp
+
+    with yt_dlp.YoutubeDL(_ydl_opts(extract_flat="in_playlist")) as ydl:
+        info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+    entries = [e for e in ((info or {}).get("entries") or []) if e]
+    if not entries:
+        return None
+    entry = entries[0]
+    url = entry.get("url") or entry.get("webpage_url")
+    if url and not is_url(url):
+        url = f"https://www.youtube.com/watch?v={url}"
+    elif not url and entry.get("id"):
+        url = f"https://www.youtube.com/watch?v={entry['id']}"
+    title = entry.get("title")
+    if not url or not title:
+        return None
+    return {"url": url, "title": title, "duration": entry.get("duration")}
+
+
+def _entry_to_track(entry: dict, requester: str, *, autoplay: bool = False) -> Track | None:
+    """Convierte una entrada "flat" de playlist de YouTube en un Track sin resolver."""
+    title = entry.get("title") or ""
+    if title in ("[Private video]", "[Deleted video]"):
+        return None
+    url = entry.get("url") or entry.get("webpage_url")
+    if url and not is_url(url):
+        url = f"https://www.youtube.com/watch?v={url}"
+    elif not url and entry.get("id"):
+        url = f"https://www.youtube.com/watch?v={entry['id']}"
+    if not url:
+        return None
+    return Track(
+        title=title or url,
+        requester=requester,
+        query=url,
+        webpage_url=url,
+        duration=entry.get("duration"),
+        autoplay=autoplay,
+    )
 
 
 def _extract_youtube_playlist(url: str, limit: int) -> tuple[str | None, list[dict]]:
@@ -224,7 +300,7 @@ async def _resolve_track(track: Track) -> None:
         log.warning("No se pudo resolver %r: %s", track.query, exc)
         raise SourceError("no pude obtener el audio") from exc
 
-    track.mark_resolved(info["url"])
+    track.mark_resolved(info["url"], info=info)
     # Completar lo que faltaba sin pisar lo que ya sabíamos (p. ej. el título
     # "Artista - Tema" que vino de Spotify).
     track.webpage_url = track.webpage_url or info.get("webpage_url")
@@ -232,6 +308,65 @@ async def _resolve_track(track: Track) -> None:
         track.duration = info.get("duration")
     if not track.title:
         track.title = info.get("title") or track.query
+
+
+# Autoplay: cuántos temas del Mix se miran (los primeros son los más
+# parecidos), cuántos se agregan por vez y el largo máximo aceptado (para no
+# meter compilados de una hora).
+AUTOPLAY_POOL = 12
+AUTOPLAY_BATCH = 3
+AUTOPLAY_MAX_SECONDS = 15 * 60
+AUTOPLAY_REQUESTER = "🎲 Autoplay"
+
+
+def track_key(track: Track) -> str:
+    """Identidad de un tema para no repetirlo (el ID de YouTube si hay)."""
+    url = track.webpage_url or track.query
+    return youtube_video_id(url) or url
+
+
+async def related_tracks(seed: Track, exclude: set[str]) -> list[Track]:
+    """Temas parecidos a `seed`, sacados del Mix de YouTube de ese video.
+
+    Elige al azar entre los más parecidos y saltea los de `exclude` (ya
+    sonaron) y los muy largos. Devuelve [] si `seed` no es de YouTube.
+    """
+    video_id = youtube_video_id(seed.webpage_url or seed.query)
+    if video_id is None:
+        return []
+    mix_url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+    loop = asyncio.get_running_loop()
+    _, entries = await loop.run_in_executor(
+        None, _extract_youtube_playlist, mix_url, AUTOPLAY_POOL + len(exclude) + 1
+    )
+    skip = exclude | {video_id}
+    candidates = []
+    for entry in entries:
+        track = _entry_to_track(entry, AUTOPLAY_REQUESTER, autoplay=True)
+        if track is None or track_key(track) in skip:
+            continue
+        if track.duration and track.duration > AUTOPLAY_MAX_SECONDS:
+            continue
+        candidates.append(track)
+        if len(candidates) >= AUTOPLAY_POOL:
+            break
+    return random.sample(candidates, min(AUTOPLAY_BATCH, len(candidates)))
+
+
+def start_resolving(track: Track) -> None:
+    """Lanza la resolución en segundo plano sin esperarla.
+
+    Quien la necesite después (reproducción o prefetch) se engancha a la
+    misma tarea vía `ensure_resolved`. Si falla, se reintenta en ese momento
+    y ahí se avisa al usuario.
+    """
+    task = asyncio.ensure_future(ensure_resolved(track))
+    task.add_done_callback(_ignore_background_error)
+
+
+def _ignore_background_error(task: asyncio.Future) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        log.debug("Resolución en segundo plano falló", exc_info=task.exception())
 
 
 async def ensure_resolved(track: Track) -> None:
@@ -288,32 +423,33 @@ async def build_tracks(query: str, requester: str, *, max_tracks: int = 100) -> 
             log.warning("Playlist de YouTube falló (%s): %s", query, exc)
             raise SourceError("No pude leer esa playlist de YouTube.") from exc
 
-        tracks = []
-        for entry in entries:
-            title = entry.get("title") or ""
-            if title in ("[Private video]", "[Deleted video]"):
-                continue
-            url = entry.get("url") or entry.get("webpage_url")
-            if url and not is_url(url):
-                url = f"https://www.youtube.com/watch?v={url}"
-            elif not url and entry.get("id"):
-                url = f"https://www.youtube.com/watch?v={entry['id']}"
-            if not url:
-                continue
-            tracks.append(
-                Track(
-                    title=title or url,
-                    requester=requester,
-                    query=url,
-                    webpage_url=url,
-                    duration=entry.get("duration"),
-                )
-            )
+        tracks = [t for t in (_entry_to_track(e, requester) for e in entries) if t]
         if not tracks:
             raise SourceError("Esa playlist está vacía o es privada.")
         return tracks[:max_tracks]
 
-    # Tema suelto: link directo (YouTube, SoundCloud, Bandcamp...) o búsqueda.
+    if not is_url(query):
+        # Búsqueda por texto: la búsqueda liviana (~1 s) ya trae título,
+        # link y duración, así que /play contesta enseguida. El audio
+        # (~3-4 s más) se extrae en segundo plano mientras tanto.
+        hit = None
+        try:
+            hit = await loop.run_in_executor(None, _search_youtube, query)
+        except Exception as exc:
+            log.warning("Búsqueda liviana falló (%r): %s", query, exc)
+        if hit is not None:
+            track = Track(
+                title=hit["title"],
+                requester=requester,
+                query=hit["url"],
+                webpage_url=hit["url"],
+                duration=hit.get("duration"),
+            )
+            start_resolving(track)
+            return [track]
+
+    # Link directo (YouTube, SoundCloud, Bandcamp...), o búsqueda si la
+    # liviana no sirvió: se resuelve ya para mostrar el título real.
     search = query if is_url(query) else f"ytsearch1:{query}"
     # Título vacío a propósito: se completa con el título real al resolver.
     track = Track(title="", requester=requester, query=search)
