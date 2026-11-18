@@ -7,6 +7,13 @@ services:
     secrets:
       - bot_env
     restart: unless-stopped
+    # Techo de consumo. Medido: ~240 MB sin música y ~760 MB de pico con 4
+    # servidores sonando a la vez (más ~1 núcleo un instante al buscar).
+    # Para más servidores, subir estos valores.
+    cpus: 1.0
+    mem_limit: 1g
+    memswap_limit: 1g  # igual a mem_limit: sin swap extra
+    pids_limit: 256
     # Evita que los logs crezcan sin límite en un VPS chico
     logging:
       driver: json-file
