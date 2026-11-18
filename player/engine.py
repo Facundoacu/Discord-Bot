@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
@@ -20,6 +21,14 @@ from .track import Track
 log = logging.getLogger("engine")
 
 AfterCallback = Callable[[Exception | None], None]
+# Dado el último tema y las claves de lo que ya sonó, devuelve temas parecidos.
+Recommender = Callable[[Track, set[str]], Awaitable[list[Track]]]
+# Cuántos temas recuerda el autoplay para no repetirlos.
+HISTORY_SIZE = 100
+
+
+def _default_key(track: Track) -> str:
+    return track.webpage_url or track.query
 
 
 class PlayerBackend(Protocol):
@@ -47,10 +56,20 @@ class PlayerEngine:
         on_idle: Callable[[], Awaitable[None]] | None = None,
         max_queue: int = 200,
         volume: float = 0.5,
+        recommender: Recommender | None = None,
+        autoplay: bool = False,
+        track_key: Callable[[Track], str] = _default_key,
     ):
         self.backend = backend
         self.queue = TrackQueue(max_size=max_queue)
         self.volume = volume
+        # Autoplay: al quedarse sin cola, sigue con temas parecidos al último.
+        self.autoplay = autoplay
+        self._recommender = recommender
+        self._track_key = track_key
+        self._history: deque[str] = deque(maxlen=HISTORY_SIZE)
+        self._last_played: Track | None = None
+        self._autofill_task: asyncio.Task | None = None
         self._resolver = resolver
         self._notify = notify
         self._on_track_start = on_track_start
@@ -70,7 +89,15 @@ class PlayerEngine:
     # --- comandos -------------------------------------------------------
 
     def add(self, tracks: list[Track]) -> int:
-        return self.queue.add_many(tracks)
+        # Lo que pide un usuario pasa adelante de lo que puso el autoplay.
+        self._cancel_autofill()
+        self.queue.drop_autoplay()
+        added = self.queue.add_many(tracks)
+        # Si ya suena algo y lo agregado quedó como próximo, resolverlo ya:
+        # así un skip inmediato no espera la extracción.
+        if added and self.busy:
+            self._prefetch_next()
+        return added
 
     async def start_if_idle(self) -> None:
         """Arranca el próximo tema si no está sonando nada."""
@@ -87,6 +114,9 @@ class PlayerEngine:
 
     def stop(self) -> None:
         """Corta todo y vacía la cola."""
+        # Sin semilla el autoplay no rellena: /stop es "basta de música".
+        self._last_played = None
+        self._cancel_autofill()
         self.queue.clear(include_current=True)
         self._skip_requested = False
         if self.busy:
@@ -123,6 +153,8 @@ class PlayerEngine:
         for task in list(self._background):
             task.cancel()
         self._background.clear()
+        self._autofill_task = None
+        self._last_played = None
         self._skip_requested = False
         self.queue.clear(include_current=True)
 
@@ -161,6 +193,10 @@ class PlayerEngine:
                 track = self.queue.advance(skipped=skipped)
                 skipped = False
                 if track is None:
+                    # Cola vacía: con autoplay, rellenar con temas parecidos
+                    # (normalmente ya se buscaron mientras sonaba el último).
+                    if await self._autofill_now():
+                        continue
                     await self._safe(self._on_idle)
                     return
 
@@ -181,9 +217,69 @@ class PlayerEngine:
                     self.queue.drop_current()
                     continue
 
+                self._last_played = track
+                self._history.append(self._track_key(track))
+                if self.autoplay and self.queue.peek_next() is None:
+                    self._start_autofill()  # buscar parecidos mientras suena
                 self._prefetch_next()
                 await self._safe(self._on_track_start, track)
                 return
+
+    # --- autoplay -------------------------------------------------------
+
+    def set_autoplay(self, enabled: bool) -> None:
+        self.autoplay = enabled
+        if not enabled:
+            self._cancel_autofill()
+            self.queue.drop_autoplay()
+        elif self.busy and self.queue.peek_next() is None:
+            self._start_autofill()
+
+    def _start_autofill(self) -> asyncio.Task | None:
+        """Busca temas parecidos al último en segundo plano (una sola vez)."""
+        if self._recommender is None or self._last_played is None:
+            return None
+        task = self._autofill_task
+        if task is None or task.done():
+            task = self._loop.create_task(self._autofill(self._last_played))
+            self._autofill_task = task
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
+        return task
+
+    async def _autofill_now(self) -> bool:
+        """Espera el relleno del autoplay. True si dejó algo en la cola."""
+        if not self.autoplay:
+            return False
+        task = self._start_autofill()
+        if task is None:
+            return False
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():  # lo canceló un /play o /stop, no a nosotros
+                return len(self.queue) > 0
+            raise
+        return len(self.queue) > 0
+
+    async def _autofill(self, seed: Track) -> None:
+        try:
+            tracks = await self._recommender(seed, set(self._history))
+        except Exception:
+            log.warning("Autoplay: no pude buscar temas parecidos a %r", seed.title, exc_info=True)
+            return
+        # Si mientras tanto hubo /stop o se apagó el autoplay, no agregar.
+        if not self.autoplay or self._last_played is not seed or not tracks:
+            return
+        added = self.queue.add_many(tracks)
+        log.info("Autoplay: agregué %d temas parecidos a %r", added, seed.title)
+        if added and self.busy:
+            self._prefetch_next()
+
+    def _cancel_autofill(self) -> None:
+        task, self._autofill_task = self._autofill_task, None
+        if task is not None and not task.done():
+            task.cancel()
 
     # --- prefetch -------------------------------------------------------
 

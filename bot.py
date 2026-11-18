@@ -5,11 +5,12 @@ import os
 import discord
 from discord import app_commands
 from discord.ext import commands
-from dotenv import load_dotenv
 
-load_dotenv()  # antes de importar módulos que lean la config
+import secret_store
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+secret_store.load()  # antes de importar módulos que lean la config
+
+TOKEN = secret_store.get("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Falta DISCORD_TOKEN en el archivo .env")
 
@@ -17,6 +18,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+secret_store.install_log_redaction()
 log = logging.getLogger("bot")
 
 

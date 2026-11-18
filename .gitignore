@@ -5,3 +5,6 @@ venv/
 .venv/
 .pytest_cache/
 .cache
+# Cualquier variante del .env tiene secretos; solo el ejemplo (vacío) se sube.
+.env.*
+!.env.example

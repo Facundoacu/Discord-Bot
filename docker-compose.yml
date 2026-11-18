@@ -1,7 +1,11 @@
 services:
   bot:
     build: .
-    env_file: .env
+    # El .env entra como secreto de solo lectura en /run/secrets/bot_env, no
+    # como variables de entorno: así los tokens no se ven con `docker inspect`
+    # ni los heredan yt-dlp/ffmpeg. Lo lee secret_store.py.
+    secrets:
+      - bot_env
     restart: unless-stopped
     # Evita que los logs crezcan sin límite en un VPS chico
     logging:
@@ -9,3 +13,7 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+secrets:
+  bot_env:
+    file: ./.env

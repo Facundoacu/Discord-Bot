@@ -217,12 +217,41 @@ def test_failed_resolution_raises_source_error_and_can_be_retried(monkeypatch):
     assert run(scenario()).stream_url == "http://ok"
 
 
-def test_plain_search_is_resolved_immediately_with_real_title(monkeypatch):
-    calls = []
+def test_plain_search_answers_with_light_search_and_resolves_in_background(monkeypatch):
+    searches, calls = [], []
+
+    def fake_search(query):
+        searches.append(query)
+        return {"url": "https://www.youtube.com/watch?v=abc", "title": "Bad Bunny - Tema", "duration": 200}
+
+    monkeypatch.setattr(sources, "_search_youtube", fake_search)
     monkeypatch.setattr(sources, "_extract_stream", fake_extract(calls))
-    tracks = run(sources.build_tracks("  bad bunny  ", "ana"))
+
+    async def scenario():
+        tracks = await sources.build_tracks("  bad bunny  ", "ana")
+        t = tracks[0]
+        # Vuelve con el título de la búsqueda, antes de tener el audio...
+        assert t.title == "Bad Bunny - Tema" and t.duration == 200 and t.stream_url is None
+        # ...y el audio se resuelve solo en segundo plano, una única vez.
+        await sources.ensure_resolved(t)
+        return tracks
+
+    tracks = run(scenario())
+    assert searches == ["bad bunny"]
+    assert calls == ["https://www.youtube.com/watch?v=abc"]
+    assert len(tracks) == 1 and tracks[0].stream_url and tracks[0].title == "Bad Bunny - Tema"
+
+
+def test_plain_search_falls_back_to_full_search_if_light_search_fails(monkeypatch):
+    def broken_search(query):
+        raise RuntimeError("YouTube cambió algo")
+
+    calls = []
+    monkeypatch.setattr(sources, "_search_youtube", broken_search)
+    monkeypatch.setattr(sources, "_extract_stream", fake_extract(calls))
+    tracks = run(sources.build_tracks("bad bunny", "ana"))
     assert calls == ["ytsearch1:bad bunny"]
-    assert len(tracks) == 1 and tracks[0].title == "Título real" and tracks[0].stream_url
+    assert tracks[0].title == "Título real" and tracks[0].stream_url
 
 
 def test_direct_url_is_passed_through_unchanged(monkeypatch):
@@ -256,3 +285,45 @@ def test_youtube_playlist_tracks_are_lazy(monkeypatch):
 def test_empty_query_is_rejected():
     with pytest.raises(SourceError):
         run(sources.build_tracks("   ", "ana"))
+
+
+# --- autoplay -----------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("https://www.youtube.com/watch?v=FGBhQbmPwH8", "FGBhQbmPwH8"),
+        ("https://www.youtube.com/watch?v=FGBhQbmPwH8&list=RDFGBhQbmPwH8", "FGBhQbmPwH8"),
+        ("https://youtu.be/FGBhQbmPwH8?si=x", "FGBhQbmPwH8"),
+        ("https://music.youtube.com/watch?v=FGBhQbmPwH8", "FGBhQbmPwH8"),
+        ("https://www.youtube.com/shorts/FGBhQbmPwH8", "FGBhQbmPwH8"),
+        ("https://soundcloud.com/a/b", None),
+        ("ytsearch1:daft punk", None),
+        (None, None),
+    ],
+)
+def test_youtube_video_id(url, expected):
+    assert sources.youtube_video_id(url) == expected
+
+
+def test_related_tracks_come_from_the_mix_and_skip_seed_played_and_long(monkeypatch):
+    def entry(vid, duration=200):
+        return {"id": vid, "title": f"Tema {vid}", "url": f"https://www.youtube.com/watch?v={vid}", "duration": duration}
+
+    asked = []
+    entries = [entry("seedSEED001"), entry("playedPLAY1"), entry("longLONG001", 3600),
+               entry("okOKOKOK001"), entry("okOKOKOK002")]
+    monkeypatch.setattr(sources, "_extract_youtube_playlist", lambda url, limit: (asked.append(url), (None, entries))[1])
+
+    seed = Track(title="x", requester="u", query="q", webpage_url="https://www.youtube.com/watch?v=seedSEED001")
+    tracks = run(sources.related_tracks(seed, {"playedPLAY1"}))
+
+    assert asked == ["https://www.youtube.com/watch?v=seedSEED001&list=RDseedSEED001"]
+    assert sorted(sources.track_key(t) for t in tracks) == ["okOKOKOK001", "okOKOKOK002"]
+    assert all(t.autoplay and t.stream_url is None for t in tracks)
+
+
+def test_related_tracks_needs_a_youtube_seed(monkeypatch):
+    monkeypatch.setattr(sources, "_extract_youtube_playlist", lambda url, limit: pytest.fail("no debería buscar"))
+    seed = Track(title="x", requester="u", query="https://soundcloud.com/a/b", webpage_url="https://soundcloud.com/a/b")
+    assert run(sources.related_tracks(seed, set())) == []

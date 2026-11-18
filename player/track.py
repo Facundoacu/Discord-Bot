@@ -18,6 +18,8 @@ class Track:
     query: str
     webpage_url: str | None = None
     duration: int | None = None
+    # Lo agregó el autoplay (no un usuario): cede su lugar a lo que pidan.
+    autoplay: bool = False
     # Se completan al resolver (ver sources.ensure_resolved).
     stream_url: str | None = None
     resolved_at: float | None = None

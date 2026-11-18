@@ -13,9 +13,18 @@ pide el usuario va directo a `yt-dlp` y el audio directo al canal de voz.
 | `/shuffle` · `/remove <pos>` · `/clear` | Administrar la cola |
 | `/loop <off/canción/cola>` | Repetir |
 | `/volume <0-100>` · `/leave` | Volumen y salir del canal |
+| `/autoplay [activar]` | Al terminarse la cola, seguir con temas parecidos (sin opción, lo alterna) |
 
-Además, cada tema que empieza trae botones (⏯️ ⏭️ 🔁 🔀 ⏹️) para no tener que tipear.
+Además, cada tema que empieza trae botones (⏯️ ⏭️ 🔁 🔀 ⏹️, y 🎲 🔉 🔊 para el autoplay y para bajar o subir el volumen de a 10 %) para no tener que tipear.
 Los comandos de control solo los puede usar quien esté en el mismo canal de voz que el bot.
+
+## Autoplay
+
+Con el autoplay activado (por defecto; `AUTOPLAY=false` en el `.env` lo apaga),
+cuando suena el último tema de la cola el bot busca en segundo plano temas
+parecidos en el *Mix* de YouTube de ese tema y elige 3 al azar entre los más
+cercanos, salteando los que ya sonaron y los compilados largos. Lo que pida
+alguien con `/play` pasa adelante de esos temas, y `/stop` corta el autoplay.
 
 ## Qué se puede reproducir
 

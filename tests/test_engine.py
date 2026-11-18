@@ -123,6 +123,18 @@ def test_next_track_is_prefetched_while_current_plays():
     run(scenario())
 
 
+def test_track_added_while_playing_is_prefetched_right_away():
+    async def scenario():
+        h = Harness()
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.engine.add([mk(2)])  # llega mientras suena t1
+        await settle()
+        assert h.resolved == ["t1", "t2"]  # un skip ya no espera la extracción
+    run(scenario())
+
+
 def test_skip_advances_even_with_loop_track():
     async def scenario():
         h = Harness()
@@ -272,4 +284,105 @@ def test_set_volume_applies_to_backend_and_future_tracks():
         h.engine.add([mk(1)])
         await h.engine.start_if_idle()
         assert h.backend.volume == 0.3
+    run(scenario())
+
+
+# --- autoplay ---------------------------------------------------------------
+
+def auto(n: int) -> Track:
+    return Track(title=f"a{n}", requester="🎲", query=f"auto{n}", autoplay=True)
+
+
+def with_autoplay(h: Harness, batches: list[list[Track]]) -> list[set[str]]:
+    """Activa el autoplay con un recomendador falso; devuelve los `exclude` que recibió."""
+    seen: list[set[str]] = []
+
+    async def recommender(seed, exclude):
+        seen.append(set(exclude))
+        return batches.pop(0) if batches else []
+
+    h.engine._recommender = recommender
+    h.engine.autoplay = True
+    return seen
+
+
+def test_autoplay_searches_while_last_track_plays_and_continues():
+    async def scenario():
+        h = Harness()
+        seen = with_autoplay(h, [[auto(1), auto(2)]])
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        assert len(seen) == 1 and "q1" in seen[0]  # buscó mientras sonaba t1, sabiendo que t1 ya sonó
+        assert h.resolved == ["t1", "a1"]          # y precargó el primero
+        h.backend.finish()
+        await settle()
+        assert h.backend.playing.title == "a1"
+        assert h.idle_calls == 0
+    run(scenario())
+
+
+def test_autoplay_waits_for_search_if_queue_ends_first():
+    async def scenario():
+        h = Harness()
+        with_autoplay(h, [[], [auto(1)]])  # la búsqueda en segundo plano no trajo nada
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.backend.finish()  # al terminarse la cola vuelve a buscar
+        await settle()
+        assert h.backend.playing.title == "a1"
+    run(scenario())
+
+
+def test_user_tracks_jump_ahead_of_autoplay_ones():
+    async def scenario():
+        h = Harness()
+        with_autoplay(h, [[auto(1), auto(2)]])
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.engine.add([mk(2)])
+        assert [t.title for t in h.engine.queue.upcoming()] == ["t2"]
+    run(scenario())
+
+
+def test_stop_does_not_trigger_autoplay():
+    async def scenario():
+        h = Harness()
+        seen = with_autoplay(h, [[auto(1)], [auto(2)]])
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.engine.stop()
+        await settle()
+        assert h.backend.playing is None and len(h.engine.queue) == 0
+        assert len(seen) == 1  # solo la búsqueda de cuando arrancó t1
+    run(scenario())
+
+
+def test_without_autoplay_queue_end_goes_idle():
+    async def scenario():
+        h = Harness()
+        seen = with_autoplay(h, [[auto(1)]])
+        h.engine.autoplay = False
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.backend.finish()
+        await settle()
+        assert seen == [] and h.backend.playing is None and h.idle_calls == 1
+    run(scenario())
+
+
+def test_turning_autoplay_off_drops_its_tracks():
+    async def scenario():
+        h = Harness()
+        with_autoplay(h, [[auto(1), auto(2)]])
+        h.engine.add([mk(1)])
+        await h.engine.start_if_idle()
+        await settle()
+        assert len(h.engine.queue) == 2
+        h.engine.set_autoplay(False)
+        assert len(h.engine.queue) == 0
     run(scenario())
