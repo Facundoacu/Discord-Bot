@@ -94,6 +94,73 @@ python bot.py
 Para desarrollar, poné `DEV_GUILD_ID` en el `.env` con el ID de tu servidor de
 pruebas: los slash commands se actualizan al instante.
 
+## Deploy en Oracle Cloud (gratis, 24 h)
+
+Oracle Cloud *Always Free* da un servidor ARM gratis que alcanza de sobra
+para unos pocos servidores de Discord. El riesgo: YouTube a veces bloquea IPs
+de datacenters (ver abajo); el script de instalación lo prueba solo.
+
+> **Importante:** el mismo token no puede correr en dos lugares a la vez.
+> Antes de levantarlo en Oracle, frená el de tu PC con `docker compose down`.
+
+### 1. Crear la cuenta y el servidor
+
+1. Registrate en https://cloud.oracle.com (piden tarjeta solo para verificar
+   identidad). La **región principal** no se puede cambiar después: elegí una
+   cercana, por ejemplo *Brazil East (São Paulo)* o *Chile (Santiago)*.
+2. *Compute → Instances → Create instance*:
+   - **Image:** Canonical Ubuntu 24.04.
+   - **Shape:** *Ampere* `VM.Standard.A1.Flex`, 1 OCPU y 6 GB de RAM.
+   - **SSH keys:** *Generate a key pair* y **descargá la clave privada**
+     (`.key`). Sin ella no podés entrar al servidor.
+3. *Create*. Cuando figure *Running*, copiá la **Public IP address**.
+
+Si dice *Out of capacity*, reintentá más tarde o probá otro *Availability
+domain*. No hace falta abrir puertos: el bot solo hace conexiones salientes.
+
+**Para que Oracle no lo apague por inactividad**, pasá la cuenta a
+*Pay As You Go* (sigue siendo gratis dentro de lo *Always Free*) y creá una
+alerta de presupuesto en *Billing → Budgets* por si acaso.
+
+### 2. Instalar el bot (desde PowerShell en tu PC)
+
+Guardá la clave en `C:\Users\<vos>\.ssh\oracle.key` y entrá al servidor
+(reemplazá `IP` por la IP pública):
+
+```bash
+ssh -i $HOME\.ssh\oracle.key ubuntu@IP
+```
+
+Ya en el servidor, bajá el código:
+
+```bash
+git clone https://github.com/Facundoacu/Discord-Bot.git && cd Discord-Bot
+```
+
+En **otra** ventana de PowerShell, desde la carpeta del bot en tu PC, copiá
+tu `.env` al servidor (así no tipeás los tokens a mano):
+
+```bash
+scp -i $HOME\.ssh\oracle.key .env ubuntu@IP:~/Discord-Bot/.env
+```
+
+De vuelta en el servidor, instalá y levantá todo:
+
+```bash
+bash scripts/setup-server.sh
+```
+
+El script instala Docker, protege el `.env`, levanta el bot (queda corriendo
+y se reinicia solo) y **prueba si YouTube deja bajar audio desde esa IP**.
+Para actualizar el bot más adelante, volvé a correr el mismo script.
+
+### Si YouTube bloquea la IP
+
+El síntoma: todos los `/play` fallan con "no pude obtener el audio", y el
+script muestra *"Sign in to confirm you're not a bot"*. Opciones:
+otra región o cuenta de Oracle, cookies de una cuenta de YouTube **secundaria**
+(puede ser suspendida), o volver a correrlo en tu PC.
+
 ## Mantenimiento
 
 **YouTube cambia seguido y `yt-dlp` hay que mantenerlo al día.** Si de golpe
