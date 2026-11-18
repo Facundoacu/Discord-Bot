@@ -19,7 +19,7 @@ from discord.ext import commands
 
 import config
 from player.engine import PlayerEngine
-from player.errors import SourceError
+from player.errors import SourceError, StreamError
 from player.queue import LoopMode
 from player.sources import build_tracks, ensure_resolved, related_tracks, track_key
 from player.text import LOOP_LABELS, escape_md, format_duration, format_queue, truncate
@@ -93,11 +93,32 @@ class YtdlpPipeAudio(discord.FFmpegPCMAudio):
             stdout=subprocess.PIPE,
             stderr=self._ytdlp_log,
         )
+        self._got_audio = False
         try:
             super().__init__(self._downloader.stdout, pipe=True, options=FFMPEG_OPTIONS)
         except Exception:
             self._close_downloader()
             raise
+
+    def read(self) -> bytes:
+        data = super().read()
+        if data:
+            self._got_audio = True
+        elif not self._got_audio:
+            # Terminó sin dar ni un frame: si fue porque yt-dlp falló (p. ej.
+            # YouTube respondió 403), avisar al motor para que reintente.
+            # discord.py pasa esta excepción al callback `after`.
+            self._raise_if_download_failed()
+        return data
+
+    def _raise_if_download_failed(self) -> None:
+        proc = self._downloader
+        try:
+            code = proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            return
+        if code != 0:
+            raise StreamError(f"yt-dlp no pudo bajar el audio (código {code})")
 
     def cleanup(self) -> None:
         # Primero yt-dlp: así el hilo que copia el pipe a ffmpeg recibe EOF y

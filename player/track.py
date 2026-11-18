@@ -20,6 +20,8 @@ class Track:
     duration: int | None = None
     # Lo agregó el autoplay (no un usuario): cede su lugar a lo que pidan.
     autoplay: bool = False
+    # Reintentos hechos porque falló la descarga del audio (ver engine).
+    stream_retries: int = 0
     # Se completan al resolver (ver sources.ensure_resolved).
     stream_url: str | None = None
     resolved_at: float | None = None
@@ -35,6 +37,13 @@ class Track:
             return True
         now = time.monotonic() if now is None else now
         return (now - self.resolved_at) > STREAM_TTL_SECONDS
+
+    def invalidate(self) -> None:
+        """Olvida la resolución: la próxima vez se extrae de cero (URL nueva)."""
+        self.stream_url = None
+        self.info = None
+        self.resolved_at = None
+        self.resolving = None
 
     def mark_resolved(self, stream_url: str, now: float | None = None, info: dict | None = None) -> None:
         self.stream_url = stream_url

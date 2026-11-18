@@ -142,3 +142,10 @@ def test_stream_url_expires_after_ttl():
     t.mark_resolved("http://x", now=1000.0)
     assert not t.needs_resolve(now=1000.0 + STREAM_TTL_SECONDS - 1)
     assert t.needs_resolve(now=1000.0 + STREAM_TTL_SECONDS + 1)
+
+
+def test_invalidate_forces_a_fresh_resolution():
+    t = Track(title="x", requester="u", query="q")
+    t.mark_resolved("http://x", now=1000.0, info={"url": "http://x"})
+    t.invalidate()
+    assert t.needs_resolve() and t.info is None and t.stream_url is None

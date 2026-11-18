@@ -1,7 +1,7 @@
 import asyncio
 
 from player.engine import PlayerEngine
-from player.errors import SourceError
+from player.errors import SourceError, StreamError
 from player.queue import LoopMode
 from player.track import Track
 
@@ -33,11 +33,11 @@ class FakeBackend:
     def resume(self): self.paused = False
     def set_volume(self, v): self.volume = v
 
-    def finish(self):
+    def finish(self, error=None):
         if self.playing is None:
             return
         after, self.playing, self.paused = self.after, None, False
-        after(None)
+        after(error)
 
 
 def mk(n: int) -> Track:
@@ -385,4 +385,61 @@ def test_turning_autoplay_off_drops_its_tracks():
         assert len(h.engine.queue) == 2
         h.engine.set_autoplay(False)
         assert len(h.engine.queue) == 0
+    run(scenario())
+
+
+# --- reintento si falla la descarga ------------------------------------------
+
+def test_failed_download_is_retried_once_with_a_fresh_resolution():
+    async def scenario():
+        h = Harness()
+        h.engine.add([mk(1), mk(2)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.backend.finish(StreamError("403"))  # YouTube rechazó la descarga
+        await settle()
+        assert h.backend.playing.title == "t1"           # el mismo tema, de nuevo
+        assert h.backend.played == ["t1", "t1"]
+        assert h.resolved.count("t1") == 2               # con una resolución nueva
+        assert h.started == ["t1"] and h.notes == []     # sin re-anunciar ni avisar
+    run(scenario())
+
+
+def test_failed_download_twice_skips_and_tells_the_user():
+    async def scenario():
+        h = Harness()
+        h.engine.add([mk(1), mk(2)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.backend.finish(StreamError("403"))
+        await settle()
+        h.backend.finish(StreamError("403"))  # el reintento también falló
+        await settle()
+        assert h.backend.playing.title == "t2"
+        assert len(h.notes) == 1 and "t1" in h.notes[0] and "YouTube" in h.notes[0]
+    run(scenario())
+
+
+def test_skip_is_never_retried_even_if_download_was_failing():
+    async def scenario():
+        h = Harness()
+        h.engine.add([mk(1), mk(2)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.engine._skip_requested = True
+        h.backend.finish(StreamError("403"))
+        await settle()
+        assert h.backend.playing.title == "t2" and h.notes == []
+    run(scenario())
+
+
+def test_other_playback_errors_just_advance():
+    async def scenario():
+        h = Harness()
+        h.engine.add([mk(1), mk(2)])
+        await h.engine.start_if_idle()
+        await settle()
+        h.backend.finish(RuntimeError("ffmpeg murió"))
+        await settle()
+        assert h.backend.played == ["t1", "t2"]
     run(scenario())

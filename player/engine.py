@@ -13,7 +13,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
-from .errors import SourceError
+from .errors import SourceError, StreamError
 from .queue import LoopMode, TrackQueue
 from .text import escape_md, truncate
 from .track import Track
@@ -25,6 +25,9 @@ AfterCallback = Callable[[Exception | None], None]
 Recommender = Callable[[Track, set[str]], Awaitable[list[Track]]]
 # Cuántos temas recuerda el autoplay para no repetirlos.
 HISTORY_SIZE = 100
+# Si YouTube rechaza la descarga de un tema, cuántas veces se reintenta con
+# una URL nueva antes de saltearlo.
+MAX_STREAM_RETRIES = 1
 
 
 def _default_key(track: Track) -> str:
@@ -162,10 +165,10 @@ class PlayerEngine:
 
     def _after(self, error: Exception | None) -> None:
         # Corre en el thread de audio de discord.py, no en el event loop.
-        if error:
+        if error and not isinstance(error, StreamError):
             log.error("Error durante la reproducción: %s", error)
         try:
-            fut = asyncio.run_coroutine_threadsafe(self._track_finished(), self._loop)
+            fut = asyncio.run_coroutine_threadsafe(self._track_finished(error), self._loop)
         except RuntimeError:  # el loop ya se cerró
             return
         fut.add_done_callback(self._log_future_error)
@@ -175,9 +178,43 @@ class PlayerEngine:
         if not fut.cancelled() and fut.exception() is not None:
             log.error("Falló el avance a la siguiente canción", exc_info=fut.exception())
 
-    async def _track_finished(self) -> None:
+    async def _track_finished(self, error: Exception | None = None) -> None:
         skipped, self._skip_requested = self._skip_requested, False
+        track = self.queue.current
+        if isinstance(error, StreamError) and not skipped and track is not None:
+            if track.stream_retries < MAX_STREAM_RETRIES:
+                track.stream_retries += 1
+                log.warning("Falló la descarga de %r (%s); reintento con una URL nueva", track.title, error)
+                if await self._replay(track):
+                    return
+            else:
+                log.warning("Falló la descarga de %r otra vez; lo salteo", track.title)
+            await self._safe(
+                self._notify,
+                f"No pude reproducir **{escape_md(truncate(track.title))}** "
+                "(YouTube rechazó la descarga). Sigo con el siguiente.",
+            )
         await self._advance(skipped=skipped)
+
+    async def _replay(self, track: Track) -> bool:
+        """Vuelve a extraer `track` desde cero y lo reproduce de nuevo, sin
+        avanzar la cola ni re-anunciarlo. True si quedó sonando (o si otro
+        camino ya arrancó algo)."""
+        async with self._lock:
+            if self.busy:
+                return True
+            if not self.backend.is_connected() or self.queue.current is not track:
+                return False
+            track.invalidate()
+            try:
+                await self._resolver(track)
+                if not self.backend.is_connected():
+                    return False
+                self.backend.play(track, self.volume, self._after)
+            except Exception:
+                log.warning("El reintento de %r falló", track.title, exc_info=True)
+                return False
+            return True
 
     async def _advance(self, *, skipped: bool = False) -> None:
         async with self._lock:
